@@ -1,6 +1,8 @@
 IPFS Cluster specification
 ==========================
 
+This document is just gathering some random and naïve thoughts on how to implement an IPFS cluster solution. It's work in progress and written in a way I understand it, without caring much about if it is comprehensible to a different mind than mine.
+
 Related issue: https://github.com/ipfs/notes/issues/58
 
 Motivation
@@ -46,7 +48,7 @@ Cons:
 
 The IPFS cluster "master" node accepts requests to persist a Hash. It then selects one of the available cluster "slaves" (say by round-robin) and assigns the task of replicating the hash. It keeps track of which slaves handle which Hashes and receives heartbeats from the slaves. When a slave goes down, it is able to reassign the replication tasks to a different one.
 
-Each of the slaves has a list of hashes they are rensposible to replicate and a table to track which IPFS node has a replica. Slaves monitor IPFS nodes on which they are replicating data and check that they are alive (as well as collect metrics). When an IPFS node goes down, the slave instruct others IPFS nodes to pin the underreplicated content. When they come back, they are requested to unpin the hashes they were responsible for before.
+Each of the slaves has a list of hashes they are rensposible to replicate and a table to track which IPFS node has a replica. Slaves monitor IPFS nodes on which they are replicating data and check that they are alive (as well as collect metrics). When an IPFS node goes down, the slave instruct other IPFS nodes to pin the underreplicated content. When they come back, they are requested to unpin the content they were responsible for before.
 
 A secondary master in inactive state can be placed next to the main one. The main one copies its state to it. When the main one goes down, the secondary one takes it's place.
 
@@ -63,20 +65,46 @@ The IPFS cluster counts with several "masters" in the sense that any of them can
 
 Coordination is performed by electing an "orchestrator" which ensures that the state object is correctly synced and distributed to every master. This can be done by using RAFT (modifications to the state being Raft's log entries).
 
-When a master A receives a request to persist a Hash X, it politely asks the "orchestrator" (RAFT's leader) to validate this. The orchestrator is the authoritative source for "who is persisting what", and this information is shared with all the other masters. Once the log message stating that A takes care of X is persisted, A takes the necessary steps to pin the hash X in the IPFS nodes of the cluster.
+When a master A receives a request to persist a Hash X, it politely asks the "orchestrator" (RAFT's leader) to select someone to perform the task. The orchestrator is the authoritative source for "who is persisting what", and this information is shared with all the other masters. Once the log message stating that a slave takes care of X is persisted, that slave takes the necessary steps to pin the hash X in the IPFS nodes of the cluster.
 
 If an IPFS cluster node (follower) goes down, the orchestrator can assign its share to a different master. If an IPFS node goes down, the masters which have objects in that node can ensure that the objects are replicated somewhere else.
 
 If the orchestrator goes down, RAFT ensures the election of a new leader and the former leader is treated like any other dissapeared follower.
 
+The orchestrator can additionally use IPFS to store and persist the state regularly, allowing the auditing and recovery of the system in cases of full disaster.
+
 Pros:
   - Looks more like proper HA
   - Tasks are balanced
   - Coordination overhead is small
+  - Auditable with replicated log
 Cons:
   - RAFT scalability (Multiraft?)
 
+### Distributed with Conflict-free Replicated Data Types (solution 1)
 
+CRDTs allow to build masterless/distributed architectures by using data types which eventually converge to the same values. Since we are distributed, we cannot assign the tasks to persis a hash to specific, but rather, only share if and by which IPFS node a hash is persisted.
+
+This requires a map [Hash -> ORSet(IPFSNode)]. When an IPFS cluster node receives a request to persist a hash, it selects the IPFS nodes to pin it and modifies the distributed ORSet for that map.
+If a request to persist a hash is received on two different IPFS cluster nodes at the same time, it may be that the hash is over-replicated. This is an issue to deal with in the future.
+
+If an IPFS Cluster node goes down, nothing happens. However when it comes back again it will need to rebuild the Map from somewhere. This somewhere can be IPFS itself, assuming it knows some of its peers and that those peers regularly store the state or updates (linked list?).
+
+If an IPFS node goes down, someone has to realize about it (problem: everyone needs to watch every hash) and persist the hashes of that node somewhere else. On large IPFS Clusters with many IPFS Cluster nodes it is possible that this task is attempted by several nodes at the same time, causing, again, undersirable side effects like over-replication.
+
+One big problem is that every IPFS Cluster node needs to take care of too many things (since we have no orchestrator to divide and assign tasks): watching IPFS nodes for failures, maintaining the full map with all the hashes up to date, merging on conflicts and making sure it stays consistent in the face of network failures of channel issues.
+
+
+Pros:
+ - Fully distributed
+ - No need for consensus protocols
+ - Easy auto-scaling
+Cons:
+ - The states we are handling are big in big IPFS clusters, thus an operation-based replication would be better but,
+ - Operation-based replication is not very resilient against failures of the channels
+ - Optimized state-based replication (using deltas) might be a compromise, but still requires sending full states from time to time
+ - Coordination overhead, specially as it grows big.
+ - Eventual consistence and quirks of CRDTs (add-wins in ORSet etc) create room for funny side-effects that need to be dealt with separately (over-replication at the very least)
 
 
 Links
@@ -84,3 +112,4 @@ Links
 
 * [Accrual Failure Detector](http://www.jaist.ac.jp/~defago/files/pdf/IS_RR_2004_010.pdf) (Cassandra)
 * CockroachDB: Multiraft: raft with consensus groups: https://www.cockroachlabs.com/blog/scaling-raft/
+* [A comprehensive study of convergent and commutative replicated data types](http://hal.upmc.fr/docs/00/55/55/88/PDF/techreport.pdf)
