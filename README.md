@@ -107,6 +107,17 @@ Cons:
  - Eventual consistence and quirks of CRDTs (add-wins in ORSet etc) create room for funny side-effects that need to be dealt with separately (over-replication at the very least)
 
 
+Open questions
+--------------
+
+- I took the assumption that IPFS stores full objects per node (rather than blocks of a single object)
+- JBenet's virtualized IPFS nodes representing an IPFS vnode which shards the data among a bunch of real IPFS nodes is a different problem. IPFS vnodes conceptually simplify the layout of IPFS clusters used for massive amounts of data. In their simplest form, they are a proxy to a subcluster. In their not not-so-simple form, they raise many questions:
+  - What happens if the virtual node goes down? If we don't want a whole subcluster to suffer, we're back to same problem: need HA and consensus.
+  - Nice IPFS properties (like DSHT distance metrics) are lost and a vNode makes the cluster behave like any old style key-value permanent storage (S3). In that sense, it may actually be interesting to think of a vIPFS node as a node with an IPFS API but underlying storage based off something completely different (say S3, Hadoop, cassandra).
+  - vNodes can become a read-bottleneck
+  - Taking the multi-master IPFS cluster approach, we can think of making each master a vNode, and the IPFS cluster underneath would just be partitioned under each master. Probably this is an idea that can be developed later.
+- Pinsets/"request-to-persist-a-hash" etc are to be defined but it is not an issue to have meta-objects about such things backed-up in IPFS in the form @jbenet suggests.
+
 Links
 -----
 
