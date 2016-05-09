@@ -1,7 +1,7 @@
 IPFS Cluster specification
 ==========================
 
-This document is just gathering some random and naïve thoughts on how to implement an IPFS cluster solution. It's work in progress and written in a way I understand it, without caring much about if it is comprehensible to a different mind than mine.
+This document is just gathering some random and thoughts on how to implement an IPFS cluster solution. It's work in progress.
 
 Related issue: https://github.com/ipfs/notes/issues/58
 
@@ -10,117 +10,211 @@ Motivation
 
 [IPFS](https://ipfs.io) is a distributed file system based on Merkle DAGs, where objects are referenced by hashes corresponding to their contents.
 
-IPFS mechanism for data permanence is called "pinning". When an IPFS nodes "pins" an object, that object is locally stored and retained, thus making the node a permanent seeder for the object. Non-pinned object's survival depends on a number of factors, including their popularity (how often they are read from the network) or the available size on the nodes (unpopular objects are likely to be forgotten at some point by their seeders if they are not pinned).
+IPFS mechanism for data permanence is called "pinning". When an IPFS nodes "pins" an object, that object is locally stored and retained, thus making the node a permanent seeder for the object. Pinning, however, is an explicit operation that is local to the node. The survival of non-pinned objects depends on a number of factors, including their popularity (how often they are read from the network) or the available size on the nodes (unpopular objects are likely to be forgotten at some point by the network).
 
-Pinning, however, is an explicit operation that is local to the node. This raises the question of how to ensure the survival of objects in an IPFS network in a general manner, so that the network can be used as **permanent storage**. IPFS Cluster aims to essentially address this problem.
+ This raises the question of how to ensure the survival of objects in an IPFS network in a general manner, so that the network can be used as **permanent storage**. IPFS Cluster aims to essentially address this problem.
 
 Features
 --------
 
 IPFS Cluster should provide the following features:
 
-- Replicated: In an IPFS cluster with n = 3 replication factor, there should *eventually* be 3 full copies of every object. Each copy should be stored in a different node.
+- IPFS Cluster is built on top of IPFS
+- Replication: In an IPFS cluster every object should *eventually* be replicated to an indicated factor. Each copy should be stored in a different node.
 - Reliable: In the event of nodes dissapearing, IPFS cluster ensures that under-replicated objects are picked up by other nodes.
-- Auto-balanced: It is possible to think of several balancing strategies (disk-space/bandwith/location/network-topology based) but disk-space balance seems like a good general-case starting point.
-- Fully HA and/or distributed: IPFS is itself distributed. Any system built on top should pay close attention to prevent the introduction of single points of failure.
-- Easy to use: strive for simplicty and sensible defaults.
+- Auto-balanced: Content is distributed evenly across the network. Distribution may be based on several factors (disk-space/bandwith/location/network-topology). Disk-space seems like a good general-case starting point.
+- HA and/or distributed: IPFS Cluster must not have a single points of failure.
+- Scalable: IPFS Cluster can scale along with the number of content it has to oversee.
+- Easy to use: strive for simplicty, sensible defaults and easy deployment.
 - Transparent: Users can keep using the IPFS network just like before.
-- Auditable: who has what (now and in previous point of time)
+- Auditable: there is a track record featuring who has what.
 
-Implementation
---------------
+Implementation thoughts
+-----------------------
 
-### Dummy
+IPFS Cluster can be implemented using a cluster of supervisor nodes (*IPFSCluster nodes* from now on), which coordinate their actions using an IPFS-based implementation of the RAFT consensus algorithm (Consul, etcd, RethinkDB).
 
-A single IPFS cluster "director" node accepts requests to persist a Hash. The director node keeps a table with IPFS nodes in the cluster, and the current state (disk space etc) and properties. The director then select N nodes and request that they pin these hashes. The director has a map (Hash -> Nodes) that keeps track of what is pinned where.
+IPFS Cluster nodes provide an endpoint `Persist(Hash, ...)` which instructs the IPFS Cluster to ensure that an IPFS object (or tree) is replicated and pinned in several IPFS network members (*IPFS nodes* from now on).
 
-The director "pings" the nodes regularly to check that they are alive. When they are not, the director removes them from the (Hash -> Nodes) tables and selects a new node to restore the replication factor. When a node re-appears, they are requested to unpin all the content (as it was replicated somewhere else in their absence).
+The IPFSCluster distributes across its IPFSCluster nodes, (with the help of a RAFT's elected leader), the task of replicating sets of Hashes. The IPFSCluster nodes monitor the IPFS nodes which they have engaged in replication and ensure that, when they become unavailable, the content is replicated somewhere else.
 
-Pros:
-  - Simple
-  - Auditable
-Cons:
-  - No HA
-  - Not scalable
-  
+The IPFSCluster leader tracks every request to persist a Hash, assigns it to one of the IPFSCluster nodes and watches them. In case of unavailability of an IPFSCluster node, the content assigned to it is transferred to one of the other members. The IPFS Cluster leader is also in charge of performing rebalancing of the assignments when needed.
 
-### Master-slave
+Let's look a bit more in detail to the implementation;
 
-The IPFS cluster "master" node accepts requests to persist a Hash. It then selects one of the available cluster "slaves" (say by round-robin) and assigns the task of replicating the hash. It keeps track of which slaves handle which Hashes and receives heartbeats from the slaves. When a slave goes down, it is able to reassign the replication tasks to a different one.
+### Raft on IPFS
 
-Each of the slaves has a list of hashes they are rensposible to replicate and a table to track which IPFS node has a replica. Slaves monitor IPFS nodes on which they are replicating data and check that they are alive (as well as collect metrics). When an IPFS node goes down, the slave instruct other IPFS nodes to pin the underreplicated content. When they come back, they are requested to unpin the content they were responsible for before.
+RAFT is a weak (majority-based) consensus protocol which allows a set of participating nodes to agree on the contents of a distributed log. Once a log is marked as commited, it ensures that such log entry has been agreed upon by the members of the cluster and will eventually be picked up by every of them.
 
-A secondary master in inactive state can be placed next to the main one. The main one copies its state to it. When the main one goes down, the secondary one takes it's place.
+It is possible to implement RAFT on IPFS with the help of IPNS, albeit not as fast as traditional implementations. IPFS-RAFT heartbeat intervals will depend on how IPNS behaves to queries/changes. That said, very fast hearbeats and small log updates offer not so many advantage over slow hearbeats and larger log updates as we will see.
 
-Pros:
-  - More HA
-  - Scales better
-Cons:
-  - Master is still a bottleneck
-  - First coordination problems (slaves try to do things at the same time in the same node)
+Lets get into details:
 
-### Multi-master with RAFT
+* In RAFT nodes receive or send messages (messages being log entries, log entry proposals, heartbeats, votes etc).
+* In IPFS-Raft, receiving reading the hash pointed by the IPNS entry of the node you want to receive from (so polling at regular intervals is required).
+* In IPFS-Raft, sending means updating the node's own IPNS hash to point to the information it wants to send.
 
-The IPFS cluster counts with several "masters" in the sense that any of them can receive requests to persist a Hash. This requires coordination between the different masters. The masters need to share a state object which tracks which master is taking care of which hashes.
+With this we have a way for RAFT cluster members to communicate. With that, we can think of a first approach to how the RAFT messages would look like.
 
-Coordination is performed by electing an "orchestrator" which ensures that the state object is correctly synced and distributed to every master. This can be done by using RAFT (modifications to the state being Raft's log entries).
+For example, the RAFT leader would like to persist a type, so it sends a message proposing to persist a log entry
 
-When a master A receives a request to persist a Hash X, it politely asks the "orchestrator" (RAFT's leader) to select someone to perform the task. The orchestrator is the authoritative source for "who is persisting what", and this information is shared with all the other masters. Once the log message stating that a slave takes care of X is persisted, that slave takes the necessary steps to pin the hash X in the IPFS nodes of the cluster.
+```
+Mode: leader
+Type: proposal
+UniqueID: 123456
+ProposeLog: <ipfs_hashA> # points to the new log entry
+Log: <ipfs_hashB> # points to the current commited log entry
+```
 
-If an IPFS cluster node (follower) goes down, the orchestrator can assign its share to a different master. If an IPFS node goes down, the masters which have objects in that node can ensure that the objects are replicated somewhere else.
+And followers would answer:
 
-If the orchestrator goes down, RAFT ensures the election of a new leader and the former leader is treated like any other dissapeared follower.
+```
+Mode: follower
+Type: ack
+UniqueID: 123456
+AckLog: <ipfs_hashA>
+Log: <ipfs_hashB>
+<...other custom fields...>
+```
 
-The orchestrator can additionally use IPFS to store and persist the state regularly, allowing the auditing and recovery of the system in cases of full disaster.
+If the master sees a majority of followers have provided an ack it will send the message:
 
-Pros:
-  - Looks more like proper HA
-  - Tasks are balanced
-  - Coordination overhead is small
-  - Auditable with replicated log
-Cons:
-  - RAFT scalability (Multiraft?)
+```
+Mode: master
+Type: commit
+UniqueID: 123458
+Log: <ipfs_hashA>
+```
 
-### Distributed with Conflict-free Replicated Data Types (solution 1)
+And the followers will publish:
 
-CRDTs allow to build masterless/distributed architectures by using data types which eventually converge to the same values. Since we are distributed, we cannot assign the tasks to persis a hash to specific, but rather, only share if and by which IPFS node a hash is persisted.
+```
+Mode: follower
+Type: ack
+UniqueID: 123458
+AckLog: <ipfs_hashA>
+Log: <ipfs_hashA>
+<...other custom fields...> # Note that a follower can use the ack messages to send back any other custom information to the master
+```
 
-This requires a map [Hash -> ORSet(IPFSNode)]. When an IPFS cluster node receives a request to persist a hash, it selects the IPFS nodes to pin it and modifies the distributed ORSet for that map.
-If a request to persist a hash is received on two different IPFS cluster nodes at the same time, it may be that the hash is over-replicated. This is an issue to deal with in the future.
+The fact that a follower publishes a message with the same UniqueID as the master acknowledges that the follower has seen the master's message. The IPNS systems provides message-signing out-of-the-box, so as long as the set of cluster members is known by all the participants, the messages are auto-signed by using IPNS to distribute them.
 
-If an IPFS Cluster node goes down, nothing happens. However when it comes back again it will need to rebuild the Map from somewhere. This somewhere can be IPFS itself, assuming it knows some of its peers and that those peers regularly store the state or updates (linked list?).
+This mechanism, with very similar messages, can be used for hearbeats when no log updates happen.
 
-If an IPFS node goes down, someone has to realize about it (problem: everyone needs to watch every hash) and persist the hashes of that node somewhere else. On large IPFS Clusters with many IPFS Cluster nodes it is possible that this task is attempted by several nodes at the same time, causing, again, undersirable side effects like over-replication.
+In the case when a leader does not get majority to commit a message, it can keep sending requests with different UniqueIDs. The leader also keeps an eye on the information published by the rest of cluster members. If a new candidate for leadership shows up, then the master needs to step down and an election needs to happen. Without entering in the election procedure part of the algorithm, we can think of messages in the form:
 
-One big problem is that every IPFS Cluster node needs to take care of too many things (since we have no orchestrator to divide and assign tasks): watching IPFS nodes for failures, maintaining the full map with all the hashes up to date, merging on conflicts and making sure it stays consistent in the face of network failures of channel issues.
+```
+Mode: candidate
+Round: 1
+```
+
+```
+Mode: voter
+Round: 1
+Vote: node02
+```
+
+With a working IPFS-RAFT implementation, we can assume that the IPFSCluster nodes have agree on an IPFS Hash. In practice, this hash is the head of a log. The format of the contents of this log hash are application dependent and, for IPFSCluster, are detailed in the next section.
+
+### IPFSCluster Log format
+
+IPFS cluster nodes run side by side with regular IPFS nodes, which they use to transmit messages and share a common distributed log, agreed upon using RAFT as stated above.
+
+This log is a linked list. On a first approach, each entry of the list would look like:
+
+```
+parent: <hash>
+assignments:
+  node00:
+    - hash1:
+        operation: persist
+        recursive: yes
+        where: [ipfsnode_33, ipfsnode_65, ipfsnode_44] # fully optional. Here to easen handover in rebalancing.
+	- hash2:
+        operation: unpersist
+        recursive: yes
+	- hash3:
+        operation: persist
+        recursive: no
+	- ...
+  node01:
+    - hash60:
+        operation: forget
+  node03:
+    - hash60:
+        operation: persist
+hash_list:
+  - node00: <ipfs_hash>
+  - node01: <ipfs_hash>
+  - ...
+```
+
+The message provides instructions for each node in the IPFS cluster to tend to the persistence of a given hash (recursively or not), or to the unpersistance (unpinning) or others (if that is supported). Adding a replication factor per object would be just another parameter. It is the cluster leader's task to divide each request-to-persist-a-hash among the followers (or itself). It can do this, for example, just by round-robin.
+
+In turn, each IPFS cluster member keeps a `hash_list` object which provides a list of all the hashes it is tending to and in which IPFS nodes they are pinned:
+
+```
+# hash_list
+<hash1>:
+  where: [ipfsnode_id1, ipfsnode_id33, ipfsnode_id50]
+  ...
+<hash2>:
+  where: [ipfsnode_id11, ipfsnode_id23, ipfsnode_id99]
+...
+```
+
+This list has several purposes: first, to keep a what-is-persisted-where relation, which can be used if the original maintainer goes offline and handed over to a new responsible node(s). Second, to test if the "assignments" made to a node are being honored. Third, to keep an account of who is persisting what at any given point in time. I am inclined to only include in this list objects which are fully persisted (they have been pinned and fully transfered to IPFS node). The comparison between the assignments and the `hash_list` should provide an idea of how much an IPFS Cluster node is lagging behind.
+
+The `hash_list` is itself persisted on IPFS and its latest-version-hash is made available to the IPFSCluster leader as part of the RAFT ACKs from the cluster members. The leader, in turn, includes the hashes in the log entries so they are retrievable if needed.
+
+At this point, each IPFS cluster node knows which hashes he has assigned and has the task to select a suitable IPFS nodes to pin the content. How this selection is performed is TBD, but it should support different strategies (along the line of Cassandra's snitching for example). In the most basic form, it could be based on available space known IPFS nodes.
+
+### Re-balancing
+
+#### IPFS cluster member offline
+
+When an IPFS cluster node loses the connection to the leader, or in the case of network partition, the RAFT protocol ensures that:
+- Nodes without majority cannot become leaders or take over the log
+- Followers without leader will not do any changes
+
+So the cluster stays in a consistent state.
+
+In the case a cluster member goes offline, the leader (or the new elected leader) knows:
+- Which hashes were assigned to that member (from the log and the `hash_list`)
+- Where are those hashes pinned (from the `hash_list`)
+
+The leader can simpy re-assign those hashes to the rest of the members of the cluster with the next message. If the lost member comes back, the leader can re-balance again the hashes assigned to each member.
+
+#### IPFS node offline
+
+In the case where an IPFS node, stops responding (see section about monitoring IPFS nodes), the IPFS cluster members which were persisting hashes to that node need to re-persist any content (which would be now underreplicated). They can select new IPFS nodes and pin the content to them, and consequently update the `hash_list` to reflect the new locations.
+
+The question of a node coming back which has pinned content which has in turned been re-pinned somewhere else is open.
+
+### Monitoring IPFS nodes
+
+This section is still very open. In it's simplest way, IPFS Cluster nodes can just regularly check if nodes are responding to commands (getHasList etc), if their ports are open and so on.
+
+Because of the nature of IPFS, it would be better to use an [Accrual Failure Detector](http://www.jaist.ac.jp/~defago/files/pdf/IS_RR_2004_010.pdf) (used by Cassandra), which dynamically adjusts to the behaviour of the monitored nodes.
+
+### Scaling IPFS Cluster
+
+There are several questions about scalability with this implementation which are open:
+
+**How many hashes can IPFS Cluster manage/persist**: This depends on the performance of IPFS-RAFT and the capacity of the underlying IPFS network to handle the data structures used by IPFS Cluster (for example, the hash lists which will grow). A way of attacking the problem might be to use a separate ad-hoc IPFS network only for IPFSCluster communication, which is not subject to the eventualities of the larger network (for example nodes randomly coming and going from public IPFS networks).
+
+Another problem in this regard is the number of IPFS nodes that an IPFSCluster node can monitor in order to detect unavailability and underreplication. Increasing the number of IPFS Cluster members to balance this task implies to increase the number of participants in the RAFT consensus, which is usually kept low. Network/hash partitions and multiraft (https://www.cockroachlabs.com/blog/scaling-raft/) might offer some relief on this regard.
+
+IPFS Virtual nodes as proposed by @jbenet might offer a solution to ever-growing IPFS networks, by encapsulating many nodes under a single one, and effectively easening IPFSCluster tasks.
+
+**How many hashes can IPFS Cluster ingest per second**: The second question is basically how hard can IPFSCluster be hammered with requests to persist new content. While RAFT would be rather slow, there is nothing preventing the leader to append many new requests to the new log entries until a proposal is formalized. This may however generate large log entries, which add further delays since they need to be persisted on IPFS too. Network bandwidth and general health of the IPFS network (and speed of IPNS) come into play for this quesion.
 
 
-Pros:
- - Fully distributed
- - No need for consensus protocols
- - Easy auto-scaling
-Cons:
- - The states we are handling are big in big IPFS clusters, thus an operation-based replication would be better but,
- - Operation-based replication is not very resilient against failures of the channels
- - Optimized state-based replication (using deltas) might be a compromise, but still requires sending full states from time to time
- - Coordination overhead, specially as it grows big.
- - Eventual consistence and quirks of CRDTs (add-wins in ORSet etc) create room for funny side-effects that need to be dealt with separately (over-replication at the very least)
+### Other open questions
 
+- I took the assumption that IPFS stores full objects per node (rather than blocks of a single object). Hope this is right.
+- @jbenet's *Virtual IPFS nodes* representing an IPFS vnode which shards the data among a bunch of real IPFS nodes is a different problem. IPFS vnodes conceptually simplify the layout of IPFS clusters used for massive amounts of data. In their simplest form, they are a proxy to a subcluster. In their not not-so-simple form, they need to be themselves HA, make sure that nice properties of IPFS are not lost (DSHT distance metrics) etc. monitor the subcluster for healthiness and so on. There is an obvious question to this: could an IPFSCluster node be an IPFS vNode at the same time? The hashes could then be persisted to its own subcluster. Moreover, having vNodes would probably help with some scaling issues. So this is an idea worth exploring but for the moment I have left it out.
+- I don't mention "Pinsets", but they are just an IPFSCluster `persist(...)` request with multiple hashes so it is easy to include the concept.
+- Also, what the `persist(...)` endpoint is exactly is not very defined. IPFSCluster could take IPFShashes pointing to PinSets, or could offer a REST endpoint or a CLI etc.
+- I have considered @kubuxu's proposal of using CRDTs to implement IPFSCluster. In fact, I would love to use CRDTs to do it, but I have been unable to come up with a solution which behaves well enough. The problems I find are mostly when things go wrong and IPFS or IPFSCluster nodes dissapear. A bunch of distributed nodes without any coordination other than a eventually-consistent-shared state need to start taking decision on how to re-persist and/or rebalance the cluster. This leaves, imho, too much space for inconsistent decisions, which, additionally, cannot be easily reverted (because that means more decisions). That said, I'm very new to CRDTs and I'm fully open to discuss about it.
 
-Open questions
---------------
-
-- I took the assumption that IPFS stores full objects per node (rather than blocks of a single object)
-- JBenet's virtualized IPFS nodes representing an IPFS vnode which shards the data among a bunch of real IPFS nodes is a different problem. IPFS vnodes conceptually simplify the layout of IPFS clusters used for massive amounts of data. In their simplest form, they are a proxy to a subcluster. In their not not-so-simple form, they raise many questions:
-  - What happens if the virtual node goes down? If we don't want a whole subcluster to suffer, we're back to same problem: need HA and consensus.
-  - Nice IPFS properties (like DSHT distance metrics) are lost and a vNode makes the cluster behave like any old style key-value permanent storage (S3). In that sense, it may actually be interesting to think of a vIPFS node as a node with an IPFS API but underlying storage based off something completely different (say S3, Hadoop, cassandra).
-  - vNodes can become a read-bottleneck
-  - Taking the multi-master IPFS cluster approach, we can think of making each master a vNode, and the IPFS cluster underneath would just be partitioned under each master. Probably this is an idea that can be developed later.
-- Pinsets/"request-to-persist-a-hash" etc are to be defined but it is not an issue to have meta-objects about such things backed-up in IPFS in the form @jbenet suggests.
-
-Links
------
-
-* [Accrual Failure Detector](http://www.jaist.ac.jp/~defago/files/pdf/IS_RR_2004_010.pdf) (Cassandra)
-* CockroachDB: Multiraft: raft with consensus groups: https://www.cockroachlabs.com/blog/scaling-raft/
-* [A comprehensive study of convergent and commutative replicated data types](http://hal.upmc.fr/docs/00/55/55/88/PDF/techreport.pdf)
