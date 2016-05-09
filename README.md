@@ -1,7 +1,7 @@
-IPFS Cluster specification
-==========================
+IPFS Cluster
+============
 
-This document is just gathering some random and thoughts on how to implement an IPFS cluster solution. It's work in progress.
+This document is just gathering some thoughts on how to implement an IPFS cluster solution. It's work in progress.
 
 Related issue: https://github.com/ipfs/notes/issues/58
 
@@ -40,7 +40,7 @@ The IPFSCluster distributes across its IPFSCluster nodes, (with the help of a RA
 
 The IPFSCluster leader tracks every request to persist a Hash, assigns it to one of the IPFSCluster nodes and watches them. In case of unavailability of an IPFSCluster node, the content assigned to it is transferred to one of the other members. The IPFS Cluster leader is also in charge of performing rebalancing of the assignments when needed.
 
-Let's look a bit more in detail to the implementation;
+Let's look a bit more in detail to the implementation:
 
 ### Raft on IPFS
 
@@ -48,7 +48,7 @@ RAFT is a weak (majority-based) consensus protocol which allows a set of partici
 
 It is possible to implement RAFT on IPFS with the help of IPNS, albeit not as fast as traditional implementations. IPFS-RAFT heartbeat intervals will depend on how IPNS behaves to queries/changes. That said, very fast hearbeats and small log updates offer not so many advantage over slow hearbeats and larger log updates as we will see.
 
-Lets get into details:
+Let's get into details:
 
 * In RAFT nodes receive or send messages (messages being log entries, log entry proposals, heartbeats, votes etc).
 * In IPFS-Raft, receiving reading the hash pointed by the IPNS entry of the node you want to receive from (so polling at regular intervals is required).
@@ -195,7 +195,7 @@ The question of a node coming back which has pinned content which has in turned 
 
 This section is still very open. In it's simplest way, IPFS Cluster nodes can just regularly check if nodes are responding to commands (getHasList etc), if their ports are open and so on.
 
-Because of the nature of IPFS, it would be better to use an [Accrual Failure Detector](http://www.jaist.ac.jp/~defago/files/pdf/IS_RR_2004_010.pdf) (used by Cassandra), which dynamically adjusts to the behaviour of the monitored nodes.
+Because of the nature of IPFS, it would be better to use an [Accrual Failure Detector](http://www.jaist.ac.jp/~defago/files/pdf/IS_RR_2004_010.pdf), which dynamically adjusts to the behaviour of the monitored nodes.
 
 ### Scaling IPFS Cluster
 
@@ -203,7 +203,7 @@ There are several questions about scalability with this implementation which are
 
 **How many hashes can IPFS Cluster manage/persist**: This depends on the performance of IPFS-RAFT and the capacity of the underlying IPFS network to handle the data structures used by IPFS Cluster (for example, the hash lists which will grow). A way of attacking the problem might be to use a separate ad-hoc IPFS network only for IPFSCluster communication, which is not subject to the eventualities of the larger network (for example nodes randomly coming and going from public IPFS networks).
 
-Another problem in this regard is the number of IPFS nodes that an IPFSCluster node can monitor in order to detect unavailability and underreplication. Increasing the number of IPFS Cluster members to balance this task implies to increase the number of participants in the RAFT consensus, which is usually kept low. Network/hash partitions and multiraft (https://www.cockroachlabs.com/blog/scaling-raft/) might offer some relief on this regard.
+Another problem in this regard is the number of IPFS nodes that an IPFSCluster node can monitor in order to detect unavailability and underreplication. Increasing the number of IPFS Cluster members to balance this task implies to increase the number of participants in the RAFT consensus, which is usually kept low. Network/hash partitions and [Multiraft](https://www.cockroachlabs.com/blog/scaling-raft/) might offer some relief on this regard.
 
 IPFS Virtual nodes as proposed by @jbenet might offer a solution to ever-growing IPFS networks, by encapsulating many nodes under a single one, and effectively easening IPFSCluster tasks.
 
